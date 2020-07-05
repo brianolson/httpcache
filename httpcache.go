@@ -1,10 +1,10 @@
-/// TODO: it is conceivable to write a big automated test for this that includes an HTTPServer and responds with varying content and caching headers and checks that a response that should be cached _doesn't_ hit the server, but that's a lot of work and I donwanna and in practice this thing works well enough for me.
 package httpcache
 
 import (
 	"bytes"
 	"encoding/binary"
 	"encoding/json"
+	"fmt"
 	"io"
 	"io/ioutil"
 	"log"
@@ -15,71 +15,65 @@ import (
 	"time"
 
 	// TODO: pluggable local storage?
+	// TODO: switch to https://github.com/dgraph-io/badger ?
 	"github.com/golang/leveldb"
 	leveldbdb "github.com/golang/leveldb/db"
 )
 
-/// Set this to enable GetHttpCache to use one app-wide http cache file
-/// e.g. flag.StringVar(&httpcache.GlobalCachePath, "cachepath", "", "path to http client cache file")
-var GlobalCachePath string = ""
-var globalHttpCacheInstance *HttpCache = nil
-var client *http.Client
-
-func GetHttpCache() http.RoundTripper {
-	if globalHttpCacheInstance != nil {
-		return globalHttpCacheInstance
+// Return a net/http RoundTripper transport which caches GETs to local storage.
+// If cachePath is "", returns http.DefaultTransport and no caching is done.
+func NewCacheTransport(cachePath string) (rt http.RoundTripper, err error) {
+	if len(cachePath) == 0 {
+		return http.DefaultTransport, nil
 	}
-	if len(GlobalCachePath) == 0 {
-		return http.DefaultTransport
+	db, err := leveldb.Open(cachePath, nil)
+	if err != nil {
+		return nil, fmt.Errorf("could not open http cache db, %v", err)
 	}
-	if globalHttpCacheInstance == nil {
-		//log.Print("building cache roundtripper")
-		db, err := leveldb.Open(GlobalCachePath, nil)
-		if err != nil {
-			log.Print("could not open http cache db ", err)
-			return http.DefaultTransport
-		}
-		globalHttpCacheInstance = &HttpCache{
-			http.DefaultTransport,
-			db,
-		}
-	}
-	return globalHttpCacheInstance
+	return &HttpCache{
+		UnderlyingTransport: http.DefaultTransport,
+		MaxBodyBytes:        1000000,
+		db:                  db,
+		cachePath:           cachePath,
+	}, nil
 }
 
-func GetClient() *http.Client {
-	if client != nil {
-		return client
+func NewClient(cachePath string) (*http.Client, error) {
+	if len(cachePath) == 0 {
+		return http.DefaultClient, nil
 	}
-	rt := GetHttpCache()
-	if rt == http.DefaultClient.Transport {
-		return http.DefaultClient
+	rt, err := NewCacheTransport(cachePath)
+	if err != nil {
+		return nil, err
 	}
-	if client == nil {
-		//log.Print("building cache client")
-		var tc http.Client = *http.DefaultClient
-		client = &tc
-		client.Transport = rt
-	}
-	return client
+	c := new(http.Client)
+	c.Transport = rt
+	return c, nil
 }
 
-// implement net/http RoundTripper
+// Implement net/http RoundTripper; store GET results to local storage.
+//
+// There's no maximum size of total cached stuff or LRU replacement.
+// Everything is cached until it expires.
+// This is simple and mostly useful for static-ish API objects? (Originally developed to hold some keys in an oauth process where the keys changed on a days-to-weeks rate.)
+//
+// TODO: max total size; LRU replacement (OR, closest-to-expiration replacement)
 type HttpCache struct {
-	defaultrt http.RoundTripper
+	// UnderlyingTransport defaults to http.DefaultTransport
+	UnderlyingTransport http.RoundTripper
+
+	// Maximum number of body bytes that will be saved to cache.
+	// Defaults to 1000000.
+	// Body gets read into RAM in its entirety whatever the size.
+	// Larger things pass through but are not written to cache.
+	MaxBodyBytes int
+
 	db        *leveldb.DB
-}
-
-type XR struct {
-	strings.Reader
-}
-
-func (xr *XR) Close() error {
-	return nil
+	cachePath string
 }
 
 // Returns nil, nil to signal caller to fall back to network and store result.
-func (hc *HttpCache) RoundTripTryCache(key []byte) (*http.Response, error) {
+func (hc *HttpCache) roundTripTryCache(key []byte) (*http.Response, error) {
 	if hc.db == nil {
 		// this database failed, so cache is disabled
 		return nil, nil
@@ -115,18 +109,7 @@ func (hc *HttpCache) RoundTripTryCache(key []byte) (*http.Response, error) {
 			hc.db.Delete(key, nil)
 			return nil, nil
 		}
-		/*
-			err = proto.Unmarshal(data[bytesused:], &sr)
-			if err != nil {
-				log.Print("error unpacking response proto ", err)
-				// delete bad stored result, go to net, store result
-				hc.db.Delete(key, nil)
-				return nil, nil
-			}
-		*/
-		//br := bytes.NewReader([]byte(*sr.Body))
 		br := strings.NewReader(sr.Body)
-		//xr := &XR{*br}
 		response := &http.Response{
 			Status:           sr.Status,
 			StatusCode:       sr.StatusCode,
@@ -186,7 +169,9 @@ func init() {
 	maxAgeRe = regexp.MustCompile(`max-age=(\d+)`)
 }
 
-// return 0 for not-cacheable
+// Parse "Cache-Control" header.
+// Return unix seconds time at which item expires.
+// Return 0 for not-cacheable.
 func CacheExpirationTime(response *http.Response) int64 {
 	cc := response.Header.Get("Cache-Control")
 	if len(cc) == 0 {
@@ -221,15 +206,16 @@ func CacheExpirationTime(response *http.Response) int64 {
 	return 0
 }
 
+// implement net/http RoundTripper
 func (hc *HttpCache) RoundTrip(request *http.Request) (*http.Response, error) {
 	// only cache GET
 	if request.Method != "GET" {
-		return hc.defaultrt.RoundTrip(request)
+		return hc.UnderlyingTransport.RoundTrip(request)
 	}
 
 	// try the cache
 	key := []byte(request.URL.String())
-	response, err := hc.RoundTripTryCache(key)
+	response, err := hc.roundTripTryCache(key)
 	if (response != nil) || (err != nil) {
 		// got either data or an error
 		//log.Print("got cache for ", string(key))
@@ -237,7 +223,7 @@ func (hc *HttpCache) RoundTrip(request *http.Request) (*http.Response, error) {
 	}
 
 	// go to the net, maybe store result
-	response, err = hc.defaultrt.RoundTrip(request)
+	response, err = hc.UnderlyingTransport.RoundTrip(request)
 	if response.StatusCode == 200 {
 		// only cache good responses
 		var expires int64 = CacheExpirationTime(response)
@@ -251,31 +237,33 @@ func (hc *HttpCache) RoundTrip(request *http.Request) (*http.Response, error) {
 			//log.Print("readBody fail ", err)
 			return nil, err
 		}
-		bas := string(bodyAll)
-		//log.Printf("read body cl=%d l=%d d=%#v", request.ContentLength, len(bodyAll), bas)
-		sr := &StoredResponse{
-			Status:           response.Status,
-			StatusCode:       response.StatusCode,
-			Proto:            response.Proto,
-			ProtoMajor:       response.ProtoMajor,
-			ProtoMinor:       response.ProtoMinor,
-			Headers:          response.Header,
-			Body:             bas,
-			TransferEncoding: request.TransferEncoding,
-			Trailers:         response.Trailer,
-		}
-		exdata := make([]byte, 10)
-		opos := binary.PutVarint(exdata, expires)
-		//srdata, err := proto.Marshal(sr)
-		srdata, err := json.Marshal(sr)
-		allout := make([]byte, opos+len(srdata))
-		copy(allout, exdata[:opos])
-		copy(allout[opos:], srdata)
-		err = hc.db.Set(key, allout, nil)
-		if err != nil {
-			log.Print("failed to store to db ", key, " ", err)
-		} else {
-			//log.Print("response cached for ", string(key))
+		if len(bodyAll) < hc.MaxBodyBytes {
+			bas := string(bodyAll)
+			//log.Printf("read body cl=%d l=%d d=%#v", request.ContentLength, len(bodyAll), bas)
+			sr := &StoredResponse{
+				Status:           response.Status,
+				StatusCode:       response.StatusCode,
+				Proto:            response.Proto,
+				ProtoMajor:       response.ProtoMajor,
+				ProtoMinor:       response.ProtoMinor,
+				Headers:          response.Header,
+				Body:             bas,
+				TransferEncoding: request.TransferEncoding,
+				Trailers:         response.Trailer,
+			}
+			exdata := make([]byte, 10)
+			opos := binary.PutVarint(exdata, expires)
+			//srdata, err := proto.Marshal(sr)
+			srdata, err := json.Marshal(sr)
+			allout := make([]byte, opos+len(srdata))
+			copy(allout, exdata[:opos])
+			copy(allout[opos:], srdata)
+			err = hc.db.Set(key, allout, nil)
+			if err != nil {
+				log.Print("failed to store to db ", key, " ", err)
+			} else {
+				//log.Print("response cached for ", string(key))
+			}
 		}
 		br := bytes.NewReader(bodyAll)
 		response.Body = ioutil.NopCloser(br)
@@ -283,6 +271,7 @@ func (hc *HttpCache) RoundTrip(request *http.Request) (*http.Response, error) {
 	return response, err
 }
 
+// database values are [varint expiration unix time seconds][json StoredResponse]
 type StoredResponse struct {
 	Status     string `json:"S"` // "200 OK"
 	StatusCode int    `json:"s"` // 200
@@ -295,3 +284,5 @@ type StoredResponse struct {
 	TransferEncoding []string            `json:"t,omitempty"`
 	Trailers         map[string][]string `json:"z,omitempty"`
 }
+
+/// TODO: it is conceivable to write a big automated test for this that includes an HTTPServer and responds with varying content and caching headers and checks that a response that should be cached _doesn't_ hit the server, but that's a lot of work and I donwanna and in practice this thing works well enough for me.
