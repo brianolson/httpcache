@@ -16,8 +16,7 @@ import (
 
 	// TODO: pluggable local storage?
 	// TODO: switch to https://github.com/dgraph-io/badger ?
-	"github.com/golang/leveldb"
-	leveldbdb "github.com/golang/leveldb/db"
+	"go.etcd.io/bbolt"
 )
 
 // Return a net/http RoundTripper transport which caches GETs to local storage.
@@ -26,7 +25,7 @@ func NewCacheTransport(cachePath string) (rt http.RoundTripper, err error) {
 	if len(cachePath) == 0 {
 		return http.DefaultTransport, nil
 	}
-	db, err := leveldb.Open(cachePath, nil)
+	db, err := bbolt.Open(cachePath, 0600, nil)
 	if err != nil {
 		return nil, fmt.Errorf("could not open http cache db, %v", err)
 	}
@@ -68,7 +67,7 @@ type HttpCache struct {
 	// Larger things pass through but are not written to cache.
 	MaxBodyBytes int
 
-	db        *leveldb.DB
+	db        *bbolt.DB
 	cachePath string
 }
 
@@ -78,11 +77,8 @@ func (hc *HttpCache) roundTripTryCache(key []byte) (*http.Response, error) {
 		// this database failed, so cache is disabled
 		return nil, nil
 	}
-	data, err := hc.db.Get(key, nil)
-	if err == leveldbdb.ErrNotFound {
-		// ok, just a cache miss
-		return nil, nil
-	} else if err != nil {
+	data, err := hc.get(key)
+	if err != nil {
 		log.Print("error reading http cache db, disabling cache ", err)
 		// the database failed, give up on it for now and go straight to net
 		hc.db = nil
@@ -96,7 +92,7 @@ func (hc *HttpCache) roundTripTryCache(key []byte) (*http.Response, error) {
 	if bytesused <= 0 {
 		log.Print("error reading cache timoeut ", bytesused)
 		// delete bad stored result, go to net, store result
-		hc.db.Delete(key, nil)
+		hc.delete(key)
 		return nil, nil
 	}
 	now := time.Now().Unix()
@@ -106,7 +102,7 @@ func (hc *HttpCache) roundTripTryCache(key []byte) (*http.Response, error) {
 		if err != nil {
 			log.Print("error unpacking response json ", err)
 			// delete bad stored result, go to net, store result
-			hc.db.Delete(key, nil)
+			hc.delete(key)
 			return nil, nil
 		}
 		br := strings.NewReader(sr.Body)
@@ -126,8 +122,25 @@ func (hc *HttpCache) roundTripTryCache(key []byte) (*http.Response, error) {
 	}
 	//log.Print("cache stale ", string(key))
 	// stale result, delete, go back to net, store result
-	hc.db.Delete(key, nil)
+	hc.delete(key)
 	return nil, nil
+}
+
+func (hc *HttpCache) get(key []byte) (data []byte, err error) {
+	err = hc.db.View(func(tx *bbolt.Tx) error {
+		bu := tx.Bucket(urlkey)
+		data = bu.Get(key)
+		return nil
+	})
+	return
+}
+
+func (hc *HttpCache) delete(key []byte) (err error) {
+	err = hc.db.Update(func(tx *bbolt.Tx) error {
+		bu := tx.Bucket(urlkey)
+		return bu.Delete(key)
+	})
+	return
 }
 
 func readBody(response *http.Response) ([]byte, error) {
@@ -206,6 +219,8 @@ func CacheExpirationTime(response *http.Response) int64 {
 	return 0
 }
 
+var urlkey = []byte("url")
+
 // implement net/http RoundTripper
 func (hc *HttpCache) RoundTrip(request *http.Request) (*http.Response, error) {
 	// only cache GET
@@ -253,12 +268,15 @@ func (hc *HttpCache) RoundTrip(request *http.Request) (*http.Response, error) {
 			}
 			exdata := make([]byte, 10)
 			opos := binary.PutVarint(exdata, expires)
-			//srdata, err := proto.Marshal(sr)
 			srdata, err := json.Marshal(sr)
 			allout := make([]byte, opos+len(srdata))
 			copy(allout, exdata[:opos])
 			copy(allout[opos:], srdata)
-			err = hc.db.Set(key, allout, nil)
+			err = hc.db.Update(func(tx *bbolt.Tx) error {
+				bu := tx.Bucket(urlkey)
+				bu.Put(key, allout)
+				return nil
+			})
 			if err != nil {
 				log.Print("failed to store to db ", key, " ", err)
 			} else {
