@@ -1,4 +1,4 @@
-module bolson.org/~/src/httpcache
+module github.com/brianolson/httpcache
 
 go 1.14
 
