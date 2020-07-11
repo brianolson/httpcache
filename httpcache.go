@@ -29,6 +29,13 @@ func NewCacheTransport(cachePath string) (rt http.RoundTripper, err error) {
 	if err != nil {
 		return nil, fmt.Errorf("could not open http cache db, %v", err)
 	}
+	err = db.Update(func(tx *bbolt.Tx) error {
+		_, err := tx.CreateBucketIfNotExists(urlkey)
+		return err
+	})
+	if err != nil {
+		return nil, fmt.Errorf("could not init http cache db, %v", err)
+	}
 	return &HttpCache{
 		UnderlyingTransport: http.DefaultTransport,
 		MaxBodyBytes:        1000000,
