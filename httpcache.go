@@ -14,7 +14,7 @@ import (
 	"strings"
 	"time"
 
-	// TODO: pluggable local storage?
+	// TODO: pluggable local storage? wrap bbolt in an interface that has simple Put/Get/Delete ops (and some kind of scan-cleanup)
 	// TODO: switch to https://github.com/dgraph-io/badger ?
 	"go.etcd.io/bbolt"
 )
